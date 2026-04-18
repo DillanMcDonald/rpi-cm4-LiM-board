@@ -4,7 +4,8 @@
 #
 # Run KiCad Design Rules Check (DRC).
 # Exits non-zero on any violations → fails CI job.
-# Also checks schematic-PCB net parity (--schematic-parity).
+# NOTE: --schematic-parity omitted for this fork — custom symbol libraries
+# fail to resolve in CI container, producing false positive parity issues.
 #
 # Env vars:
 #   PROJECT_DIR  - root dir to search for .kicad_pcb  (default: .)
@@ -23,13 +24,10 @@ mkdir -p "$DRC_DIR"
 
 info "DRC on: $PCB"
 
-# Note: --schematic-parity omitted — custom symbol libraries (CM4IO, etc.)
-# fail to resolve in the CI container, making parity check report false
-# positives. Net connectivity is verified by "0 unconnected items" in DRC.
 "$KICAD_CLI" pcb drc \
   --output               "$DRC_DIR/drc-report.json" \
   --format               json \
   --exit-code-violations \
   "$PCB"
 
-info "DRC complete — see drc-report.json for violations"
+info "DRC passed — no violations"

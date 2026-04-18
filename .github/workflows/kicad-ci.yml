@@ -6,10 +6,11 @@
 # Pipeline scripts: DillanMcDonald/kicad-ci (MIT)
 #
 # Jobs:
-#   erc    → Electrical Rules Check
-#   drc    → Design Rules Check + schematic parity
-#   export → Full professional documentation suite
-#   release→ GitHub Release on v* tags
+#   erc       → Electrical Rules Check (advisory — upstream has intentional unconnects)
+#   drc       → Design Rules Check (advisory — KiCad 5→9 stricter rules)
+#   export    → Full professional doc set + iBoM + testpoints + README
+#   release   → GitHub Release with all docs attached (tags matching v*)
+#   pages     → KDT-style HTML navigation site on GitHub Pages
 #
 # Container: ghcr.io/kicad/kicad:9.0 (GPL-3.0 binary, MIT pipeline scripts)
 
@@ -19,24 +20,38 @@ on:
   push:
     branches: ["**"]
     tags:     ["v*"]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'templates/**'
   pull_request:
     branches: ["**"]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'templates/**'
   workflow_dispatch:
+
+concurrency:
+  group: kicad-ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   # LiM-board (original minimal version — USB-C power + CM4 + status LEDs)
   # Use the LiM+ variant by changing to:
   #   hardware/rpi-cm4-LiM+-board/KiCad Files
   PROJECT_DIR: "hardware/rpi-cm4-LiM-board/KiCad Files"
-  # GitHub-hosted runners have no GPU — raytraced 3D render skipped.
-  # Set to 0 on a self-hosted runner with GPU for rendered PNG output.
   SKIP_RENDER: "1"
+  BOARD_VARIANT: "RELEASED"
 
 # ── ERC ───────────────────────────────────────────────────────────────────────
 jobs:
   erc:
     name: "ERC — Electrical Rules Check"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     container:
       image: ghcr.io/kicad/kicad:9.0
       options: --user root
@@ -49,10 +64,7 @@ jobs:
         run: chmod +x scripts/*.sh scripts/lib/*.sh
 
       - name: Run ERC
-        # continue-on-error: ERC is advisory for this upstream board.
-        # The original project has intentional unconnected CM4 GPIO pins
-        # which KiCad 9 classifies as errors in its default ERC rules.
-        # DRC (layout) is the hard blocker. See erc-report artifact for detail.
+        # Advisory: upstream board has intentional unconnected CM4 GPIO pins
         run: scripts/erc.sh
         continue-on-error: true
 
@@ -68,7 +80,8 @@ jobs:
   drc:
     name: "DRC — Design Rules Check"
     runs-on: ubuntu-latest
-    # DRC checks PCB layout — independent of ERC (schematic). Run in parallel.
+    timeout-minutes: 15
+    # Parallel with ERC — DRC checks layout, independent of schematic
     container:
       image: ghcr.io/kicad/kicad:9.0
       options: --user root
@@ -81,10 +94,7 @@ jobs:
         run: chmod +x scripts/*.sh scripts/lib/*.sh
 
       - name: Run DRC
-        # continue-on-error: this board was designed in KiCad 5/6; KiCad 9
-        # applies stricter default DRC rules (18 violations found). Board has
-        # been manufactured and functions correctly. Key metric: 0 unconnected.
-        # Violations are captured in artifact for engineer review.
+        # Advisory: KiCad 5→9 stricter rules, 18 violations. 0 unconnected.
         run: scripts/drc.sh
         continue-on-error: true
 
@@ -100,6 +110,7 @@ jobs:
   export:
     name: "Export — Full Documentation Suite"
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [drc]
     container:
       image: ghcr.io/kicad/kicad:9.0
@@ -108,14 +119,67 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Make scripts executable
-        run: chmod +x scripts/*.sh scripts/lib/*.sh
+        run: chmod +x scripts/*.sh scripts/lib/*.sh scripts/*.py
+
+      - name: Cache KiCad 3D models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/kicad/9.0/3dmodels
+            /root/.local/share/kicad/9.0/3dmodels
+          key: kicad-3d-${{ hashFiles('**/*.kicad_pcb') }}
+          restore-keys: kicad-3d-
+
+      - name: Inject git metadata
+        run: |
+          PRO=$(find "$PROJECT_DIR" -maxdepth 2 -name "*.kicad_pro" | sort | head -1)
+          if [[ -n "$PRO" ]]; then
+            python3 scripts/inject_git_meta.py \
+              --project "$PRO" \
+              --variant "$BOARD_VARIANT"
+          fi
+
+      - name: Sync revision from CHANGELOG
+        run: |
+          SCH=$(find "$PROJECT_DIR" -maxdepth 2 -name "*.kicad_sch" \
+                ! -name "*-rescue*" ! -path "*/ignore/*" ! -path "*/backups/*" \
+                | sort | head -1)
+          if [[ -n "$SCH" ]]; then
+            python3 scripts/sync_revision.py --schematic "$SCH"
+          fi
 
       - name: Export all documentation
         run: scripts/export.sh
 
-      - name: Upload — Fabrication (Gerbers + drill + ZIP)
+      - name: Generate Interactive BOM
+        run: scripts/ibom.sh
+        continue-on-error: true
+
+      - name: Extract test points
+        run: |
+          PCB=$(find "$PROJECT_DIR" -maxdepth 2 -name "*.kicad_pcb" \
+                ! -path "*/ignore/*" ! -path "*/backups/*" | sort | head -1)
+          if [[ -n "$PCB" ]]; then
+            python3 scripts/extract_testpoints.py --pcb "$PCB"
+          fi
+        continue-on-error: true
+
+      - name: Generate README
+        run: |
+          PCB=$(find "$PROJECT_DIR" -maxdepth 2 -name "*.kicad_pcb" \
+                ! -path "*/ignore/*" ! -path "*/backups/*" | sort | head -1)
+          if [[ -n "$PCB" ]]; then
+            pip install --quiet jinja2 2>/dev/null || true
+            python3 scripts/gen_readme.py --pcb "$PCB" --output output/docs/BOARD-README.md
+          fi
+        continue-on-error: true
+
+      # ── Artifact uploads ──────────────────────────────────────────────────
+      - name: Upload — Fabrication
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -123,7 +187,7 @@ jobs:
           path: output/fab/
           if-no-files-found: warn
 
-      - name: Upload — Documentation (PDFs + SVG schematic)
+      - name: Upload — Documentation
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -131,7 +195,7 @@ jobs:
           path: output/docs/
           if-no-files-found: warn
 
-      - name: Upload — Board previews (SVG)
+      - name: Upload — Board previews
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -139,7 +203,7 @@ jobs:
           path: output/preview/
           if-no-files-found: warn
 
-      - name: Upload — Assembly (BOM + pick-and-place + ZIP)
+      - name: Upload — Assembly
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -147,7 +211,7 @@ jobs:
           path: output/assembly/
           if-no-files-found: warn
 
-      - name: Upload — 3D (STEP model + renders)
+      - name: Upload — 3D
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -155,10 +219,27 @@ jobs:
           path: output/3d/
           if-no-files-found: warn
 
+      - name: Upload — Test points
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: testpoints-${{ github.sha }}
+          path: output/testpoints/
+          if-no-files-found: warn
+
+      - name: Upload — Source (for KiCanvas viewer)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-${{ github.sha }}
+          path: output/source/
+          if-no-files-found: warn
+
 # ── Release ───────────────────────────────────────────────────────────────────
   release:
     name: "Release — Publish full doc set on tag"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: export
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -179,23 +260,25 @@ jobs:
         run: |
           cd release-assets
           for dir in */; do
-            name=$(echo "${dir%/}" | sed "s/-${{ github.sha }}//")
-            zip -r "${name}.zip" "$dir"
+            category="${dir%/}"
+            name=$(echo "$category" | sed "s/-${{ github.sha }}//")
+            zip -r "${name}.zip" "$category/"
           done
+          ls -lh *.zip
 
       - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*.zip
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "Release $GITHUB_REF_NAME" \
-            --generate-notes \
-            release-assets/*.zip
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 # ── Pages ─────────────────────────────────────────────────────────────────────
   pages:
     name: "Pages — Deploy board preview site"
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [erc, drc, export]
     if: github.event_name != 'pull_request' && needs.export.result == 'success'
     permissions:
@@ -214,44 +297,63 @@ jobs:
 
       - name: Download fab artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: fab-${{ github.sha }}
           path: site/fab/
 
       - name: Download docs artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: docs-${{ github.sha }}
           path: site/docs/
 
       - name: Download preview artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: preview-${{ github.sha }}
           path: site/preview/
 
       - name: Download assembly artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: assembly-${{ github.sha }}
           path: site/assembly/
 
       - name: Download 3D artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: 3d-${{ github.sha }}
           path: site/3d/
 
+      - name: Download test points
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: testpoints-${{ github.sha }}
+          path: site/testpoints/
+
+      - name: Download KiCanvas source
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: source-${{ github.sha }}
+          path: site/source/
+
       - name: Download ERC report
         uses: actions/download-artifact@v4
-        if: always()
+        continue-on-error: true
         with:
           name: erc-report
           path: site/reports/erc/
 
       - name: Download DRC report
         uses: actions/download-artifact@v4
-        if: always()
+        continue-on-error: true
         with:
           name: drc-report
           path: site/reports/drc/
