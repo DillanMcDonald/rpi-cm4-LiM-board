@@ -163,6 +163,7 @@ jobs:
         env:
           DIGIKEY_CLIENT_ID: ${{ secrets.DIGIKEY_CLIENT_ID }}
           DIGIKEY_CLIENT_SECRET: ${{ secrets.DIGIKEY_CLIENT_SECRET }}
+          DIGIKEY_DEBUG: "1"
           MOUSER_API_KEY: ${{ secrets.MOUSER_API_KEY }}
           NEXAR_CLIENT_ID: ${{ secrets.NEXAR_CLIENT_ID }}
           NEXAR_CLIENT_SECRET: ${{ secrets.NEXAR_CLIENT_SECRET }}
